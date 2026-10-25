@@ -1,0 +1,643 @@
+#!/usr/bin/env python3
+"""Publie des fichiers du dépôt enseignant vers le dépôt étudiant, par PR.
+
+Les correspondances source -> cible sont décrites dans publication.toml, à la
+racine du dépôt enseignant : des fichiers ([[fichier]]) ou des dossiers entiers
+([[dossier]], récursifs, avec `exclure`). Le script copie les fichiers
+sélectionnés mais n'efface rien côté étudiant, sauf demande explicite (vider,
+preparer --depuis-zero) ou dossier déclaré `miroir = true` : ce qui y est
+présent sans être recopié est conservé et listé dans le rapport. Les
+suppressions passent, elles aussi, par une PR.
+
+Un dossier `miroir` rend le contenu de sa cible identique à celui de sa source
+(hors `exclure`) : ce qui a disparu de la source est supprimé de la cible, et
+listé. Le miroir ne touche que sa cible, et seulement si le dossier est
+sélectionné en entier (un motif qui n'en prend qu'une partie ne supprime rien).
+Les sources d'un dossier sont les fichiers suivis par git ou non ignorés.
+
+Le script vit dans le sous-module `publication/` des dépôts enseignants (voir
+README.md) et s'exécute depuis l'un d'eux. La publication se fait par étapes, sans jamais toucher au checkout du dépôt
+étudiant (tout se passe dans un worktree dédié) :
+
+  simuler   [motifs]  rapport seul : ce que preparer ferait, rien n'est écrit
+  preparer  [motifs]  worktree + branche publication/<date> depuis origin/main,
+                      copie, commit local, rapport ; on peut alors relire.
+                      --depuis-zero : repart d'un dépôt vide (tout ce qui n'est
+                      pas recopié est supprimé, et listé)
+  vider     [motifs]  prépare la suppression de tout le contenu du dépôt
+                      étudiant, ou des fichiers correspondant aux motifs
+                      (chemins côté étudiant) ; puis deployer et finaliser
+  deployer            pousse la branche et ouvre la PR (description = rapport)
+  finaliser           après fusion (ou abandon) de la PR : supprime worktree et
+                      branches, met à jour la branche de base du dépôt étudiant
+  etat                publication en cours : branche, worktree, PR
+  initialiser         dépôt étudiant vide seulement : pousse un commit vide sur
+                      la branche de base, pour que tout contenu passe par PR
+
+Un motif sélectionne une entrée si sa cible ou sa source y correspond
+(syntaxe fnmatch, où '*' traverse aussi les '/') ; sans motif, tout est publié.
+
+Exemples :
+
+  scripts/publier-etudiant simuler
+  scripts/publier-etudiant preparer 'td/*' cours/mesure-integration.pdf
+  scripts/publier-etudiant deployer
+  scripts/publier-etudiant finaliser
+  scripts/publier-etudiant vider                      # fin du cours : tout retirer
+  scripts/publier-etudiant preparer --depuis-zero     # nouvelle année : repartir de zéro
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import fnmatch
+import hashlib
+import shutil
+import subprocess
+import sys
+import tempfile
+import tomllib
+from dataclasses import dataclass, field
+from pathlib import Path
+
+
+# ---------------------------------------------------------------------------
+# Utilitaires
+
+
+class Erreur(Exception):
+    """Erreur attendue : message clair, sans trace."""
+
+
+def git(depot: Path, *args: str, verifier: bool = True, entree: str | None = None) -> str:
+    res = subprocess.run(["git", "-C", str(depot), *args],
+                         capture_output=True, text=True, input=entree)
+    if verifier and res.returncode != 0:
+        detail = (res.stderr or res.stdout or "").strip()
+        raise Erreur(f"git {' '.join(args)} a échoué dans {depot}\n{detail}")
+    return (res.stdout or "").strip()
+
+
+def gh(depot: Path, *args: str, verifier: bool = True) -> str:
+    res = subprocess.run(["gh", *args], cwd=depot, capture_output=True, text=True)
+    if verifier and res.returncode != 0:
+        raise Erreur(f"gh {' '.join(args[:3])} a échoué :\n{res.stderr.strip()}")
+    return res.stdout.strip()
+
+
+def empreinte(chemin: Path) -> str:
+    """Empreinte git (blob) du fichier : la même que `git hash-object`."""
+    donnees = chemin.read_bytes()
+    h = hashlib.sha1(b"blob %d\0" % len(donnees))
+    h.update(donnees)
+    return h.hexdigest()
+
+
+def taille(octets: int) -> str:
+    if octets < 1024:
+        return f"{octets} o"
+    if octets < 1024 * 1024:
+        return f"{octets / 1024:.0f} Ko"
+    return f"{octets / (1024 * 1024):.1f} Mo"
+
+
+# ---------------------------------------------------------------------------
+# Configuration
+
+
+@dataclass(frozen=True)
+class Dossier:
+    source: str
+    cible: str
+    miroir: bool = False
+    exclure: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class Entree:
+    source: str
+    cible: str
+    dossier: Dossier | None = None    # dossier dont ce fichier est issu
+
+
+@dataclass
+class Config:
+    racine: Path          # racine du dépôt enseignant
+    depot: Path           # clone local du dépôt étudiant
+    worktree: Path        # worktree de la publication en cours
+    branche: str          # branche de base des PR
+    entrees: list[Entree]             # fichiers, dossiers développés
+    dossiers: list[Dossier] = field(default_factory=list)
+
+
+def chemin_relatif(racine: Path, valeur: str) -> Path:
+    p = Path(valeur).expanduser()
+    return (p if p.is_absolute() else racine / p).resolve()
+
+
+def lire_config(chemin: Path, depot_force: str | None) -> Config:
+    if not chemin.is_file():
+        raise Erreur(f"configuration introuvable : {chemin}")
+    with chemin.open("rb") as f:
+        brut = tomllib.load(f)
+    racine = chemin.resolve().parent
+    section = brut.get("depot", {})
+    if depot_force:
+        depot = Path(depot_force).expanduser().resolve()
+    elif section.get("chemin"):
+        depot = chemin_relatif(racine, section["chemin"])
+    else:
+        raise Erreur("publication.toml : [depot] chemin manquant (ou --depot)")
+    worktree = (chemin_relatif(racine, section["worktree"]) if section.get("worktree")
+                else depot.with_name(depot.name + "-publication"))
+    entrees, cibles, dossiers = [], {}, []
+
+    def ajouter(entree: Entree) -> None:
+        if entree.cible in cibles:
+            raise Erreur(f"publication.toml : cible {entree.cible!r} en double "
+                         f"({cibles[entree.cible]} et {entree.source})")
+        cibles[entree.cible] = entree.source
+        entrees.append(entree)
+
+    for i, e in enumerate(brut.get("fichier", []), 1):
+        cadre = f"[[fichier]] n°{i}"
+        try:
+            source, cible = e["source"], e["cible"]
+        except KeyError as manque:
+            raise Erreur(f"publication.toml : {cadre} sans {manque}") from None
+        ajouter(Entree(verifier_chemin(source, "source", cadre),
+                       verifier_chemin(cible, "cible", cadre)))
+    for i, e in enumerate(brut.get("dossier", []), 1):
+        cadre = f"[[dossier]] n°{i}"
+        try:
+            source, cible = e["source"], e["cible"]
+        except KeyError as manque:
+            raise Erreur(f"publication.toml : {cadre} sans {manque}") from None
+        if not isinstance(e.get("miroir", False), bool):
+            raise Erreur(f"publication.toml : {cadre} : miroir doit être true ou false")
+        exclure = e.get("exclure", [])
+        if not isinstance(exclure, list) or not all(isinstance(m, str) for m in exclure):
+            raise Erreur(f"publication.toml : {cadre} : exclure doit être une liste de motifs")
+        d = Dossier(verifier_chemin(source, "source", cadre), verifier_chemin(cible, "cible", cadre),
+                    e.get("miroir", False), tuple(exclure))
+        dossiers.append(d)
+        for relatif in fichiers_du_dossier(racine, d):
+            ajouter(Entree(f"{d.source}/{relatif}", f"{d.cible}/{relatif}", d))
+    if not entrees:
+        raise Erreur("publication.toml : aucune entrée [[fichier]] ni [[dossier]]")
+    if not (depot / ".git").exists():
+        raise Erreur(f"{depot} n'est pas un dépôt git (voir [depot] chemin ou --depot)")
+    return Config(racine, depot, worktree, section.get("branche", "main"), entrees, dossiers)
+
+
+def verifier_chemin(valeur: str, role: str, cadre: str) -> str:
+    """Refuse un chemin vide, absolu, qui sort du dépôt ou vise .git."""
+    parties = Path(valeur).parts
+    if (not valeur.strip() or Path(valeur).is_absolute() or ".." in parties
+            or Path(valeur).as_posix() in (".", "") or parties[0] == ".git"):
+        raise Erreur(f"publication.toml : {cadre} : {role} {valeur!r} refusée "
+                     "(vide, racine du dépôt, absolue, hors du dépôt ou .git)")
+    return Path(valeur).as_posix()
+
+
+def exclu(relatif: str, motifs: tuple[str, ...]) -> bool:
+    """Un motif d'exclusion vise un nom, un chemin relatif ou un dossier entier."""
+    parties = relatif.split("/")
+    return any(fnmatch.fnmatch(relatif, m) or any(fnmatch.fnmatch(p, m) for p in parties)
+               for m in motifs)
+
+
+def fichiers_du_dossier(racine: Path, d: Dossier) -> list[str]:
+    """Fichiers de la source, relatifs au dossier : suivis ou non ignorés, hors `exclure`."""
+    base = racine / d.source
+    if not base.is_dir():
+        raise Erreur(f"publication.toml : dossier source introuvable : {d.source}")
+    sortie = git(racine, "ls-files", "-z", "--cached", "--others", "--exclude-standard",
+                 "--", d.source)
+    fichiers = set()
+    for chemin in filter(None, sortie.split("\0")):
+        relatif = Path(chemin).relative_to(d.source).as_posix()
+        if (racine / chemin).is_file() and not exclu(relatif, d.exclure):
+            fichiers.add(relatif)
+    if not fichiers:
+        raise Erreur(f"publication.toml : le dossier source {d.source} est vide (hors exclure) : "
+                     "refus de publier (et, en miroir, de tout supprimer)")
+    return sorted(fichiers)
+
+
+def selectionner(entrees: list[Entree], motifs: list[str]) -> list[Entree]:
+    if not motifs:
+        return list(entrees)
+
+    def correspond(e: Entree, m: str) -> bool:
+        noms = [e.cible, e.source]
+        if e.dossier:
+            noms += [e.dossier.cible, e.dossier.source]
+        return any(fnmatch.fnmatch(n, m) for n in noms)
+
+    sans_effet = [m for m in motifs if not any(correspond(e, m) for e in entrees)]
+    if sans_effet:
+        raise Erreur("motif sans correspondance dans publication.toml : " + ", ".join(sans_effet))
+    return [e for e in entrees if any(correspond(e, m) for m in motifs)]
+
+
+# ---------------------------------------------------------------------------
+# Rapport
+
+
+@dataclass
+class Rapport:
+    ajoutes: list[str]
+    modifies: list[str]
+    inchanges: list[str]
+    geres_non_selectionnes: list[str]
+    hors_config: list[str]
+    avertissements: list[str]
+    origine: str
+    supprimes: list[str] = field(default_factory=list)
+    action: str = "publication"
+
+    @property
+    def change(self) -> bool:
+        return bool(self.ajoutes or self.modifies or self.supprimes)
+
+    def titre(self) -> str:
+        parties = []
+        if self.modifies:
+            parties.append(f"{len(self.modifies)} modifié(s)")
+        if self.ajoutes:
+            parties.append(f"{len(self.ajoutes)} ajouté(s)")
+        if self.supprimes:
+            parties.append(f"{len(self.supprimes)} supprimé(s)")
+        return f"{self.action} : " + (", ".join(parties) if parties else "aucun changement")
+
+    def texte(self, markdown: bool = False) -> str:
+        puce = "- " if markdown else "  "
+        code = (lambda s: f"`{s}`") if markdown else (lambda s: s)
+        lignes = [f"Source : dépôt enseignant {self.origine}.", ""]
+
+        def bloc(titre: str, elements: list[str], brut: bool = False) -> None:
+            if not elements:
+                return
+            lignes.append(f"{'### ' if markdown else ''}{titre} ({len(elements)})")
+            lignes.extend(puce + (e if brut else code(e)) for e in elements)
+            lignes.append("")
+
+        bloc("Modifiés (A -> A')", self.modifies, brut=True)
+        bloc("Ajoutés", self.ajoutes, brut=True)
+        bloc("Supprimés", self.supprimes)
+        bloc("Inchangés", self.inchanges)
+        if self.action == "retrait":
+            bloc("Conservés, gérés par publication.toml", self.geres_non_selectionnes)
+            bloc("Conservés, hors publication.toml", self.hors_config)
+        else:
+            bloc("Présents, gérés par publication.toml mais non recopiés cette fois (conservés)",
+                 self.geres_non_selectionnes)
+            bloc("Présents, hors publication.toml (conservés, non touchés)", self.hors_config)
+        bloc("Avertissements", self.avertissements, brut=True)
+        return "\n".join(lignes).rstrip() + "\n"
+
+
+def fichiers_presents(depot: Path, ref: str) -> list[str]:
+    """Fichiers suivis dans `ref` du dépôt étudiant."""
+    sortie = git(depot, "ls-tree", "-r", "--name-only", ref)
+    return sorted(sortie.splitlines()) if sortie else []
+
+
+def origine(cfg: Config) -> str:
+    return (f"{git(cfg.racine, 'rev-parse', '--abbrev-ref', 'HEAD')}"
+            f"@{git(cfg.racine, 'rev-parse', '--short', 'HEAD')}")
+
+
+def miroir_a_vider(cfg: Config, choisies: list[Entree]) -> list[Dossier]:
+    """Dossiers miroir sélectionnés en entier : seuls dont la cible est nettoyée."""
+    choisis = {e.cible for e in choisies}
+    return [d for d in cfg.dossiers
+            if d.miroir and all(e.cible in choisis for e in cfg.entrees if e.dossier == d)]
+
+
+def dans_miroir(cible: str, miroirs: list[Dossier]) -> bool:
+    """`cible` est sous un dossier miroir et n'est pas exclu par lui."""
+    return any(cible.startswith(d.cible + "/")
+               and not exclu(cible[len(d.cible) + 1:], d.exclure) for d in miroirs)
+
+
+def comparer(cfg: Config, choisies: list[Entree], arbre: Path, presents: list[str],
+             depuis_zero: bool = False) -> Rapport:
+    """Compare les sources choisies aux fichiers de `arbre` et dresse le rapport.
+
+    Avec `depuis_zero`, tout ce qui est présent et non recopié est supprimé.
+    """
+    manquantes = [e.source for e in choisies if not (cfg.racine / e.source).is_file()]
+    if manquantes:
+        raise Erreur("source(s) introuvable(s) dans le dépôt enseignant :\n  "
+                     + "\n  ".join(manquantes))
+    avertissements = []
+    sale = git(cfg.racine, "status", "--porcelain", "--", *[e.source for e in choisies])
+    if sale:
+        avertissements.append(
+            "sources non commitées dans le dépôt enseignant (publiées telles quelles) : "
+            + ", ".join(l.split(maxsplit=1)[1] for l in sale.splitlines()))
+
+    ajoutes, modifies, inchanges = [], [], []
+    for e in choisies:
+        src, dst = cfg.racine / e.source, arbre / e.cible
+        neuf = empreinte(src)
+        if not dst.is_file():
+            ajoutes.append(f"{e.cible} : {neuf[:7]} ({taille(src.stat().st_size)}), depuis {e.source}")
+            continue
+        ancien = empreinte(dst)
+        if ancien == neuf:
+            inchanges.append(e.cible)
+        else:
+            modifies.append(f"{e.cible} : {ancien[:7]} ({taille(dst.stat().st_size)}) -> "
+                            f"{neuf[:7]} ({taille(src.stat().st_size)}), depuis {e.source}")
+
+    ecrites = {e.cible for e in choisies}
+    gerees = {e.cible for e in cfg.entrees}
+    restants = [c for c in presents if c not in ecrites]
+    miroirs = miroir_a_vider(cfg, choisies)
+    en_miroir = [c for c in restants if c not in gerees and dans_miroir(c, miroirs)]
+    if depuis_zero:
+        return Rapport(ajoutes=ajoutes, modifies=modifies, inchanges=inchanges,
+                       geres_non_selectionnes=[], hors_config=[],
+                       avertissements=avertissements, origine=origine(cfg),
+                       supprimes=restants)
+    return Rapport(
+        ajoutes=ajoutes, modifies=modifies, inchanges=inchanges,
+        geres_non_selectionnes=[c for c in restants if c in gerees],
+        hors_config=[c for c in restants if c not in gerees and c not in en_miroir],
+        avertissements=avertissements, origine=origine(cfg), supprimes=en_miroir,
+    )
+
+
+def copier(cfg: Config, choisies: list[Entree], arbre: Path) -> None:
+    for e in choisies:
+        dst = arbre / e.cible
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(cfg.racine / e.source, dst)
+
+
+# ---------------------------------------------------------------------------
+# Étapes
+
+
+def base_distante(cfg: Config) -> str:
+    git(cfg.depot, "fetch", "--quiet", "--prune", "origin")
+    ref = f"origin/{cfg.branche}"
+    if not git(cfg.depot, "rev-parse", "--verify", "--quiet", ref, verifier=False):
+        raise Erreur(f"{ref} n'existe pas : le dépôt étudiant est vide.\n"
+                     "Lancer d'abord « publier-etudiant initialiser ».")
+    return ref
+
+
+def branche_en_cours(cfg: Config) -> str | None:
+    if not (cfg.worktree / ".git").exists():
+        return None
+    return git(cfg.worktree, "rev-parse", "--abbrev-ref", "HEAD")
+
+
+def exiger_publication(cfg: Config) -> str:
+    branche = branche_en_cours(cfg)
+    if branche is None:
+        raise Erreur(f"aucune publication en cours (pas de worktree {cfg.worktree}).\n"
+                     "Lancer d'abord « publier-etudiant preparer ».")
+    return branche
+
+
+def cmd_simuler(cfg: Config, args: argparse.Namespace) -> int:
+    base = base_distante(cfg)
+    choisies = selectionner(cfg.entrees, args.motifs)
+    with tempfile.TemporaryDirectory(prefix="publication-etudiant-") as tmp:
+        arbre = Path(tmp) / "arbre"
+        git(cfg.depot, "worktree", "add", "--quiet", "--detach", str(arbre), base)
+        try:
+            rapport = comparer(cfg, choisies, arbre, fichiers_presents(cfg.depot, base),
+                               depuis_zero=args.depuis_zero)
+        finally:
+            git(cfg.depot, "worktree", "remove", "--force", str(arbre), verifier=False)
+    print(f"Simulation (rien n'est écrit) — {rapport.titre()}\n")
+    print(rapport.texte())
+    return 0
+
+
+def ouvrir_publication(cfg: Config) -> tuple[str, str]:
+    """Crée le worktree et la branche publication/<date> ; rend (base, branche)."""
+    en_cours = branche_en_cours(cfg)
+    if en_cours:
+        raise Erreur(f"une publication est déjà en cours : {en_cours} dans {cfg.worktree}.\n"
+                     "La déployer (deployer) ou l'abandonner (finaliser) d'abord.")
+    base = base_distante(cfg)
+    branche = f"publication/{dt.datetime.now():%Y%m%d-%H%M%S}"
+    git(cfg.depot, "worktree", "add", "--quiet", "-b", branche, str(cfg.worktree), base)
+    return base, branche
+
+
+def annuler_publication(cfg: Config, branche: str) -> None:
+    git(cfg.depot, "worktree", "remove", "--force", str(cfg.worktree), verifier=False)
+    git(cfg.depot, "branch", "--quiet", "-D", branche, verifier=False)
+
+
+def conclure(cfg: Config, rapport: Rapport, branche: str) -> None:
+    print(f"{rapport.titre()}\n")
+    print(rapport.texte())
+    print(f"Publication préparée sur la branche {branche}, dans le worktree :\n"
+          f"  {cfg.worktree}\n"
+          f"Relire (fichiers, git -C {cfg.worktree} show --stat), puis :\n"
+          "  publier-etudiant deployer    pousser et ouvrir la PR\n"
+          "  publier-etudiant finaliser   abandonner (supprime worktree et branche)")
+
+
+def cmd_preparer(cfg: Config, args: argparse.Namespace) -> int:
+    choisies = selectionner(cfg.entrees, args.motifs)
+    base, branche = ouvrir_publication(cfg)
+    try:
+        rapport = comparer(cfg, choisies, cfg.worktree, fichiers_presents(cfg.depot, base),
+                           depuis_zero=args.depuis_zero)
+        if not rapport.change:
+            raise Erreur("rien à publier : les fichiers sélectionnés sont déjà à jour.\n\n"
+                         + rapport.texte())
+        if rapport.supprimes:
+            git(cfg.worktree, "rm", "-r", "--quiet", "--", *rapport.supprimes)
+        copier(cfg, choisies, cfg.worktree)
+        git(cfg.worktree, "add", "--", *[e.cible for e in choisies])
+        git(cfg.worktree, "commit", "--quiet", "-F", "-",
+            entree=rapport.titre() + "\n\n" + rapport.texte())
+    except BaseException:
+        annuler_publication(cfg, branche)
+        raise
+    conclure(cfg, rapport, branche)
+    return 0
+
+
+def cmd_vider(cfg: Config, args: argparse.Namespace) -> int:
+    base, branche = ouvrir_publication(cfg)
+    try:
+        presents = fichiers_presents(cfg.depot, base)
+        if args.motifs:
+            sans_effet = [m for m in args.motifs
+                          if not any(fnmatch.fnmatch(c, m) for c in presents)]
+            if sans_effet:
+                raise Erreur("motif sans correspondance dans le dépôt étudiant : "
+                             + ", ".join(sans_effet))
+            supprimes = [c for c in presents if any(fnmatch.fnmatch(c, m) for m in args.motifs)]
+        else:
+            supprimes = list(presents)
+        if not supprimes:
+            raise Erreur("rien à supprimer : le dépôt étudiant est déjà vide.")
+        gerees = {e.cible for e in cfg.entrees}
+        restants = [c for c in presents if c not in supprimes]
+        rapport = Rapport(ajoutes=[], modifies=[], inchanges=[],
+                          geres_non_selectionnes=[c for c in restants if c in gerees],
+                          hors_config=[c for c in restants if c not in gerees],
+                          avertissements=[], origine=origine(cfg), supprimes=supprimes,
+                          action="retrait")
+        git(cfg.worktree, "rm", "-r", "--quiet", "--", *supprimes)
+        git(cfg.worktree, "commit", "--quiet", "-F", "-",
+            entree=rapport.titre() + "\n\n" + rapport.texte())
+    except BaseException:
+        annuler_publication(cfg, branche)
+        raise
+    conclure(cfg, rapport, branche)
+    return 0
+
+
+def cmd_deployer(cfg: Config, args: argparse.Namespace) -> int:
+    branche = exiger_publication(cfg)
+    if git(cfg.worktree, "status", "--porcelain"):
+        raise Erreur(f"le worktree {cfg.worktree} a des modifications non commitées : "
+                     "les commiter (ou les annuler) avant de déployer.")
+    git(cfg.worktree, "push", "--quiet", "-u", "origin", branche)
+    existante = gh(cfg.worktree, "pr", "view", branche, "--json", "url", "--jq", ".url",
+                   verifier=False)
+    if existante:
+        print(f"Branche {branche} poussée ; PR déjà ouverte : {existante}")
+        return 0
+    titre = git(cfg.worktree, "log", "-1", "--format=%s")
+    corps = git(cfg.worktree, "log", "-1", "--format=%b")
+    corps_md = rapport_markdown(corps)
+    url = gh(cfg.worktree, "pr", "create", "--base", cfg.branche, "--head", branche,
+             "--title", titre, "--body", corps_md)
+    print(f"PR ouverte : {url}\n"
+          "Une fois la PR fusionnée (ou fermée) : publier-etudiant finaliser")
+    return 0
+
+
+def rapport_markdown(texte: str) -> str:
+    """Le corps du commit (texte brut) mis en forme pour la description de PR."""
+    lignes = []
+    for l in texte.splitlines():
+        if l.startswith("  "):
+            lignes.append("- " + l.strip())
+        elif l and not l.startswith("Source :"):
+            lignes.append("### " + l)
+        else:
+            lignes.append(l)
+    return "\n".join(lignes).rstrip() + "\n\n_Généré par `scripts/publier-etudiant`._\n"
+
+
+def cmd_finaliser(cfg: Config, args: argparse.Namespace) -> int:
+    branche = exiger_publication(cfg)
+    etat = gh(cfg.worktree, "pr", "view", branche, "--json", "state", "--jq", ".state",
+              verifier=False)
+    if etat == "OPEN" and not args.force:
+        raise Erreur(f"la PR de {branche} est encore ouverte : la fusionner ou la fermer, "
+                     "ou relancer avec --force pour abandonner quand même.")
+    non_pousse = not etat and not args.force
+    if non_pousse:
+        raise Erreur(f"{branche} n'a pas de PR (non déployée) : relancer avec --force pour "
+                     "abandonner cette publication.")
+    git(cfg.depot, "worktree", "remove", "--force", str(cfg.worktree))
+    git(cfg.depot, "branch", "--quiet", "-D", branche, verifier=False)
+    if git(cfg.depot, "ls-remote", "--heads", "origin", branche, verifier=False):
+        git(cfg.depot, "push", "--quiet", "origin", "--delete", branche, verifier=False)
+    git(cfg.depot, "fetch", "--quiet", "--prune", "origin")
+    maj = ""
+    courante = git(cfg.depot, "symbolic-ref", "--short", "-q", "HEAD", verifier=False)
+    if courante == cfg.branche and not git(cfg.depot, "status", "--porcelain", "--untracked-files=no"):
+        if git(cfg.depot, "rev-parse", "--verify", "--quiet", "HEAD", verifier=False):
+            git(cfg.depot, "merge", "--quiet", "--ff-only", f"origin/{cfg.branche}", verifier=False)
+        else:
+            git(cfg.depot, "reset", "--quiet", "--hard", f"origin/{cfg.branche}", verifier=False)
+        maj = f" ; {cfg.branche} du dépôt étudiant mise à jour"
+    print(f"Publication {branche} finalisée (PR : {etat or 'aucune'}) : worktree et "
+          f"branche supprimés{maj}.")
+    return 0
+
+
+def cmd_etat(cfg: Config, args: argparse.Namespace) -> int:
+    branche = branche_en_cours(cfg)
+    if branche is None:
+        print(f"Aucune publication en cours. Dépôt étudiant : {cfg.depot}")
+        return 0
+    titre = git(cfg.worktree, "log", "-1", "--format=%s")
+    pr = gh(cfg.worktree, "pr", "view", branche, "--json", "url,state",
+            "--jq", '"\\(.state) \\(.url)"', verifier=False)
+    print(f"Publication en cours : {branche} — {titre}\n"
+          f"  worktree : {cfg.worktree}\n"
+          f"  PR       : {pr or 'non déployée (publier-etudiant deployer)'}")
+    return 0
+
+
+def cmd_initialiser(cfg: Config, args: argparse.Namespace) -> int:
+    git(cfg.depot, "fetch", "--quiet", "origin")
+    if git(cfg.depot, "rev-parse", "--verify", "--quiet", f"origin/{cfg.branche}", verifier=False):
+        raise Erreur(f"origin/{cfg.branche} existe déjà : rien à initialiser.")
+    arbre_vide = git(cfg.depot, "hash-object", "-t", "tree", "--stdin", "-w", entree="")
+    commit = git(cfg.depot, "commit-tree", arbre_vide, "-m",
+                 "chore: initialise le dépôt étudiant\n\n"
+                 "Commit vide : le contenu est publié par PR (scripts/publier-etudiant).")
+    git(cfg.depot, "push", "--quiet", "origin", f"{commit}:refs/heads/{cfg.branche}")
+    print(f"origin/{cfg.branche} créée (commit vide {commit[:7]}). "
+          "Suite : publier-etudiant preparer")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="publier-etudiant",
+        description=__doc__.split("\n\n")[0],
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="\n\n".join(__doc__.split("\n\n")[1:]),
+    )
+    parser.add_argument("--config", type=Path,
+                        help="configuration (défaut : publication.toml à la racine du dépôt enseignant)")
+    parser.add_argument("--depot", help="clone local du dépôt étudiant (surcharge [depot] chemin)")
+    sous = parser.add_subparsers(dest="commande", required=True, metavar="commande")
+    for nom, aide in (("simuler", "rapport seul, rien n'est écrit"),
+                      ("preparer", "worktree + branche, copie, commit local")):
+        p = sous.add_parser(nom, help=aide)
+        p.add_argument("motifs", nargs="*", help="cibles ou sources à publier (fnmatch)")
+        p.add_argument("--depuis-zero", action="store_true",
+                       help="repartir d'un dépôt vide : ce qui n'est pas recopié est supprimé")
+    p = sous.add_parser("vider", help="préparer la suppression de tout (ou des motifs)")
+    p.add_argument("motifs", nargs="*", help="fichiers du dépôt étudiant à supprimer (fnmatch)")
+    sous.add_parser("deployer", help="pousser la branche et ouvrir la PR")
+    p = sous.add_parser("finaliser", help="supprimer worktree et branches après la PR")
+    p.add_argument("--force", action="store_true",
+                   help="abandonner une publication non déployée ou dont la PR est ouverte")
+    sous.add_parser("etat", help="publication en cours")
+    sous.add_parser("initialiser", help="dépôt étudiant vide : commit vide sur la branche de base")
+    args = parser.parse_args(argv)
+
+    commandes = {"simuler": cmd_simuler, "preparer": cmd_preparer, "vider": cmd_vider,
+                 "deployer": cmd_deployer,
+                 "finaliser": cmd_finaliser, "etat": cmd_etat, "initialiser": cmd_initialiser}
+    try:
+        if args.config:
+            config = args.config
+        else:   # le dépôt enseignant est celui du répertoire courant
+            config = Path(git(Path.cwd(), "rev-parse", "--show-toplevel")) / "publication.toml"
+        cfg = lire_config(config, args.depot)
+        return commandes[args.commande](cfg, args)
+    except Erreur as e:
+        print(f"publier-etudiant : {e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
