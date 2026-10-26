@@ -12,6 +12,10 @@ git -C publication describe --tags --always
 
 ## Non publié
 
+- Un dossier contenant des sous-modules git est publié avec leurs fichiers
+  (jusqu'ici le gitlink seul était vu, d'où un dossier « vide » refusé). Un
+  sous-module non initialisé est refusé avec un message explicite (#3).
+
 ---
 
 ## v1.1.0 — 2026-10-26

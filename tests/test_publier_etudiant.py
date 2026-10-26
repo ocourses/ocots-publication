@@ -109,6 +109,50 @@ DOSSIER = '[[dossier]]\nsource = "site"\ncible = "site"\nmiroir = true\n'
 
 
 class Dossiers(Base):
+    def ajouter_sous_module(self):
+        module = Path(self._tmp.name) / "socle"
+        module.mkdir()
+        subprocess.run(["git", "init", "-q", "-b", "main", str(module)], check=True)
+        ecrire(module, {"index.html": "socle\n", "js/theme.js": "theme\n"})
+        git(module, "add", "-A")
+        git(module, "commit", "-q", "-m", "socle")
+        subprocess.run(
+            ["git", "-C", str(self.ens), "-c", "protocol.file.allow=always",
+             "-c", "user.name=t", "-c", "user.email=t@t", "submodule", "add", "-q",
+             str(module), "site/socle"],
+            check=True, capture_output=True,
+        )
+        return module
+
+    def test_miroir_supprime_un_fichier_disparu_du_sous_module(self):
+        self.ajouter_sous_module()
+
+        def retouche():
+            git(self.ens / "site/socle", "rm", "-q", "js/theme.js")
+            git(self.ens / "site/socle", "commit", "-q", "-m", "retrait")
+        r = self.rapport(self.publier_puis_modifier_source(DOSSIER, retouche))
+        self.assertEqual(r.supprimes, ["site/socle/js/theme.js"])
+        self.assertIn("site/socle/index.html", r.inchanges)
+
+    def test_sous_module_non_initialise_refuse(self):
+        self.ajouter_sous_module()
+        self.valider()
+        git(self.ens, "submodule", "deinit", "-q", "-f", "site/socle")
+        with self.assertRaises(pe.Erreur) as ctx:
+            self.config(DOSSIER)
+        self.assertIn("non initialisé", str(ctx.exception))
+
+    def test_sous_module_est_copie_comme_des_fichiers(self):
+        self.ajouter_sous_module()
+        cfg = self.config(DOSSIER)
+
+        r = self.rapport(cfg)
+
+        self.assertEqual(len(r.ajoutes), 6)
+        wt = self.preparer(cfg)
+        self.assertEqual((wt / "site/socle/index.html").read_text(), "socle\n")
+        self.assertEqual((wt / "site/socle/js/theme.js").read_text(), "theme\n")
+
     def test_ajout_recursif(self):
         r = self.rapport(self.config(DOSSIER))
         self.assertEqual(len(r.ajoutes), 4)
