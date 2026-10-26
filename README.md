@@ -52,6 +52,21 @@ Un **dossier** est copié récursivement : fichiers suivis par git ou non
 ignorés, moins ceux de `exclure` (motifs fnmatch sur un nom, un chemin relatif
 ou un dossier entier, côté source et côté cible).
 
+Les sous-modules git présents dans un dossier sont parcourus récursivement :
+leurs fichiers sont copiés dans le dépôt étudiant, et non leur seul gitlink.
+Le sous-module doit donc être initialisé dans le dépôt enseignant. Par exemple,
+avec un socle dans `site/socle/` :
+
+```toml
+[[dossier]]
+source = "site"
+cible = "site"
+miroir = true
+```
+
+publie aussi `site/socle/...` dans le dépôt étudiant ; celui-ci n'a pas besoin
+de cloner le sous-module.
+
 Avec **`miroir = true`**, le contenu de la cible devient exactement celui de la
 source : ce que la source n'a plus est supprimé de la cible, et listé sous
 « Supprimés ». Sans miroir, **rien n'est jamais supprimé**. Garde-fous :

@@ -216,10 +216,8 @@ def fichiers_du_dossier(racine: Path, d: Dossier) -> list[str]:
     base = racine / d.source
     if not base.is_dir():
         raise Erreur(f"publication.toml : dossier source introuvable : {d.source}")
-    sortie = git(racine, "ls-files", "-z", "--cached", "--others", "--exclude-standard",
-                 "--", d.source)
     fichiers = set()
-    for chemin in filter(None, sortie.split("\0")):
+    for chemin in fichiers_git(racine, d.source):
         relatif = Path(chemin).relative_to(d.source).as_posix()
         if (racine / chemin).is_file() and not exclu(relatif, d.exclure):
             fichiers.add(relatif)
@@ -227,6 +225,36 @@ def fichiers_du_dossier(racine: Path, d: Dossier) -> list[str]:
         raise Erreur(f"publication.toml : le dossier source {d.source} est vide (hors exclure) : "
                      "refus de publier (et, en miroir, de tout supprimer)")
     return sorted(fichiers)
+
+
+def fichiers_git(depot: Path, dossier: str = "") -> list[str]:
+    """Retourne les fichiers d'un dépôt, en développant les sous-modules."""
+    arguments = ["ls-files", "-z", "--cached", "--others", "--exclude-standard"]
+    if dossier:
+        arguments += ["--", dossier]
+    sortie = git(depot, *arguments)
+
+    stages = ["ls-files", "-z", "--stage"]
+    if dossier:
+        stages += ["--", dossier]
+    gitlinks = set()
+    for entree in filter(None, git(depot, *stages).split("\0")):
+        metadonnees, chemin = entree.split("\t", 1)
+        if metadonnees.split(maxsplit=1)[0] == "160000":
+            gitlinks.add(Path(chemin))
+
+    fichiers = []
+    for entree in filter(None, sortie.split("\0")):
+        chemin = Path(entree)
+        if chemin in gitlinks:
+            sous_module = depot / chemin
+            if not (sous_module / ".git").exists():
+                raise Erreur(f"publication : sous-module non initialisé : {chemin}")
+            for enfant in fichiers_git(sous_module):
+                fichiers.append((chemin / enfant).as_posix())
+        elif (depot / chemin).is_file():
+            fichiers.append(chemin.as_posix())
+    return fichiers
 
 
 def selectionner(entrees: list[Entree], motifs: list[str]) -> list[Entree]:
