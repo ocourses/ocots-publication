@@ -1,0 +1,27 @@
+name: Release
+
+# Un tag vX.Y.Z poussé crée la release GitHub, avec pour notes la section
+# « ## vX.Y.Z » du CHANGELOG. Échoue si la section manque, ou si la version
+# annoncée par `publier-etudiant --version` ne correspond pas au tag.
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Version du script = tag
+        run: |
+          script="v$(python3 bin/publier-etudiant --version | awk '{print $NF}')"
+          test "$script" = "$GITHUB_REF_NAME" || {
+            echo "le script annonce $script, le tag est $GITHUB_REF_NAME"; exit 1; }
+      - run: .github/scripts/notes-de-version "$GITHUB_REF_NAME" > notes.md
+      - run: gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file notes.md
+        env:
+          GH_TOKEN: ${{ github.token }}

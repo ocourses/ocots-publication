@@ -14,6 +14,14 @@ git -C publication describe --tags --always
 
 ---
 
+## v1.1.0 — 2026-10-26
+
+- `publier-etudiant --version` annonce la version ; une constante `VERSION` la
+  porte, et un test vérifie qu'elle a sa section dans ce CHANGELOG.
+- Workflow `release.yml` : un tag `vX.Y.Z` poussé crée la release GitHub, avec
+  pour notes la section du CHANGELOG ; il échoue si la section manque ou si la
+  version du script n'est pas celle du tag.
+
 ## v1.0.0 — 2026-10-25
 
 Première version partagée, extraite de `scripts/publier-etudiant` de
