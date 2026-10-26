@@ -66,7 +66,7 @@ from pathlib import Path
 # Utilitaires
 
 
-VERSION = "1.1.0"   # semver ; doit correspondre au tag vX.Y.Z et au CHANGELOG
+VERSION = "1.2.0"   # semver ; doit correspondre au tag vX.Y.Z et au CHANGELOG
 
 
 class Erreur(Exception):
