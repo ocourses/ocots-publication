@@ -88,5 +88,14 @@ python3 -m unittest discover -s tests
 
 ## Publier une version
 
-PR `chore(release): vX.Y.Z` (CHANGELOG), puis tag annoté sur le commit de merge.
-Les cours montent ensuite l'épingle, une PR par cours.
+Versions sémantiques : majeure si `publication.toml` ou le comportement d'une
+commande change de façon incompatible, mineure pour une fonction ajoutée,
+corrective sinon. Procédure, comme pour `ocots-conventions` :
+
+1. PR `chore(release): vX.Y.Z` : section `## vX.Y.Z — date` du CHANGELOG et
+   constante `VERSION` de `bin/publier-etudiant` ;
+2. une fois la PR fusionnée, tag annoté sur le commit de merge :
+   `git tag -a vX.Y.Z -m vX.Y.Z && git push origin vX.Y.Z` ;
+3. le workflow `release.yml` crée la release GitHub (notes = section du
+   CHANGELOG) et vérifie que le script annonce bien le tag ;
+4. les cours montent l'épingle de `publication/`, une PR par cours.

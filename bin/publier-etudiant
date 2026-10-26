@@ -66,6 +66,9 @@ from pathlib import Path
 # Utilitaires
 
 
+VERSION = "1.1.0"   # semver ; doit correspondre au tag vX.Y.Z et au CHANGELOG
+
+
 class Erreur(Exception):
     """Erreur attendue : message clair, sans trace."""
 
@@ -606,6 +609,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--config", type=Path,
                         help="configuration (défaut : publication.toml à la racine du dépôt enseignant)")
+    parser.add_argument("--version", action="version", version=f"publier-etudiant {VERSION}")
     parser.add_argument("--depot", help="clone local du dépôt étudiant (surcharge [depot] chemin)")
     sous = parser.add_subparsers(dest="commande", required=True, metavar="commande")
     for nom, aide in (("simuler", "rapport seul, rien n'est écrit"),

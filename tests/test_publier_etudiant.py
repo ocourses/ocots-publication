@@ -225,5 +225,17 @@ class Refus(Base):
         self.refuse(DOSSIER + '[[dossier]]\nsource = "site/js"\ncible = "site/js"\n', "en double")
 
 
+class Version(unittest.TestCase):
+    def test_version_documentee_dans_le_changelog(self):
+        changelog = (SCRIPT.parents[1] / "CHANGELOG.md").read_text()
+        self.assertRegex(pe.VERSION, r"^\d+\.\d+\.\d+$")
+        self.assertRegex(changelog, rf"(?m)^## v{pe.VERSION.replace('.', r'\.')} — ")
+
+    def test_option_version(self):
+        sortie = subprocess.run([sys.executable, str(SCRIPT), "--version"],
+                                capture_output=True, text=True, check=True).stdout
+        self.assertEqual(sortie.strip(), f"publier-etudiant {pe.VERSION}")
+
+
 if __name__ == "__main__":
     unittest.main()
